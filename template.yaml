@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Temporary Amazon Linux 2023 test server.
+  Connect by AWS Systems Manager Session Manager without SSH.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  RootVolumeSize:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 100
+    Description: Root EBS volume size in GiB
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Latest Amazon Linux 2023 x86_64 AMI
+
+  AllowIpAdr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: MyIPaddress
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-IGW'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PublicSubnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-PublicRouteTable'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn:
+      - VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  TestServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-TestServerRole'
+      Description: IAM role for the temporary test EC2 server
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEC2AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-TestServerRole'
+        - Key: Purpose
+          Value: TemporaryTest
+
+  TestServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-InstanceProfile'
+      Roles:
+        - !Ref TestServerRole
+
+  TestServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for temporary test server
+      VpcId: !Ref VPC
+
+      SecurityGroupIngress:
+        - Description: Allow HTTP inbound
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: Allow HTTPS inbound
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - Description: Allow ICMP inbound
+          IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+        - Description: Allow SSH
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowIpAdr
+      # SSM、OS更新などへのアウトバウンド通信を許可
+      SecurityGroupEgress:
+        - Description: Allow all outbound IPv4 traffic
+          IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-TestServerSG'
+        - Key: Purpose
+          Value: TemporaryTest
+
+  TestServer:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - PublicDefaultRoute
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet
+      KeyName: !Ref KeyName
+
+      IamInstanceProfile: !Ref TestServerInstanceProfile
+
+      SecurityGroupIds:
+        - !Ref TestServerSecurityGroup
+
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref RootVolumeSize
+            Encrypted: true
+            DeleteOnTermination: true
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          apt update
+          apt install -y apache2
+
+          systemctl enable apache2
+          systemctl start apache2
+
+          systemctl enable amazon-ssm-agent
+          systemctl restart amazon-ssm-agent
+          cat <<EOF > /var/www/html/index.html
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>CloudFormation Test</title>
+          </head>
+          <body>
+            <h1>Apache is running!</h1>
+            <p>Stack: ${AWS::StackName}</p>
+            <p>Region: ${AWS::Region}</p>
+          </body>
+          </html>
+          EOF
+
+          cat <<'EOF' > /etc/motd
+          Temporary AWS test server
+          Stack: ${AWS::StackName}
+          Region: ${AWS::Region}
+
+          Delete the CloudFormation stack when testing is complete.
+          EOF
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-LinuxTestServer'
+        - Key: Purpose
+          Value: TemporaryTest
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  PublicSubnetId:
+    Description: Public subnet ID
+    Value: !Ref PublicSubnet
+
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref TestServer
+
+  PrivateIpAddress:
+    Description: Private IPv4 address of the test server
+    Value: !GetAtt TestServer.PrivateIp
+
+  PublicIpAddress:
+    Description: Public IPv4 address of the test server
+    Value: !GetAtt TestServer.PublicIp
+
+  AvailabilityZone:
+    Description: Availability Zone of the test server
+    Value: !GetAtt TestServer.AvailabilityZone
+
+  SessionManagerCommand:
+    Description: AWS CLI command to connect through Session Manager
+    Value: !Sub >
+      aws ssm start-session
+      --target ${TestServer}
+      --region ${AWS::Region}
